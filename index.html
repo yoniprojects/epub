@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Reader</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/epubjs/dist/epub.min.js"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Literata:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Slab:wght@400;500;700&family=Lora:ital,wght@0,400;0,600;1,400&family=Rubik:wght@400;500;700&family=Frank+Ruhl+Libre:wght@400;500;700&family=Noto+Sans+Hebrew:wght@400;600&family=Noto+Serif+Hebrew:wght@400;700&display=swap" rel="stylesheet">
@@ -88,30 +89,13 @@ body[data-theme="paper"]{
 
 /* scroll mode */
 #scrollPane{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;}
-#scrollPane .flow{max-width:640px;margin:0 auto;padding:36px 26px 60vh;}
 
 /* page mode */
 #pagePane{position:absolute;inset:0;overflow:hidden;}
 #pageViewport{position:absolute;inset:0;overflow:hidden;}
-#pageTrack{position:relative;height:100%;will-change:transform;}
-#pageTrack.animating{transition:transform .32s cubic-bezier(.22,.61,.36,1);}
-.page-col-host{
-  position:absolute;inset:0;padding:36px 30px;
-}
-.page-col-host .inner{
-  height:100%;
-  column-gap:60px;
-}
 .tap-zone{position:absolute;top:0;bottom:0;width:22%;z-index:5;}
 .tap-zone.left{left:0;}
 .tap-zone.right{right:0;}
-
-.reader-text{font-size:18px;line-height:1.7;}
-.reader-text p{margin:0 0 1em;text-align:justify;text-wrap:pretty;orphans:2;widows:2;}
-.reader-text img{max-width:100%;height:auto;display:block;margin:0 auto;}
-.reader-text h1,.reader-text h2,.reader-text h3{line-height:1.3;margin:.6em 0 .5em;}
-.reader-text hr{border:none;border-top:1px solid var(--border);margin:2em 0;}
-.reader-text[dir="rtl"] p{text-align:justify;}
 
 /* ruler */
 #ruler{
@@ -216,12 +200,10 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     </div>
 
     <div class="content-wrap" id="contentWrap">
-      <div id="scrollPane"><div class="flow reader-text" id="scrollFlow"></div></div>
+      <div id="scrollPane"></div>
 
       <div id="pagePane">
-        <div id="pageViewport">
-          <div id="pageTrack"></div>
-        </div>
+        <div id="pageViewport"></div>
         <div class="tap-zone left" id="tapLeft"></div>
         <div class="tap-zone right" id="tapRight"></div>
       </div>
@@ -339,7 +321,7 @@ const DEFAULT_SETTINGS = {
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS_SETTINGS, {}));
 let library = loadJSON(LS_LIB, []); // [{id,title,author,coverDataUrl,name,size,lastModified,hasHandle}]
-let progressMap = loadJSON(LS_PROG, {}); // id -> {chapterIndex, pageIndex, scrollFrac}
+let progressMap = loadJSON(LS_PROG, {}); // id -> {cfi, percent, locations}
 
 function persistSettings(){ saveJSON(LS_SETTINGS, settings); }
 function persistLibrary(){ saveJSON(LS_LIB, library); }
@@ -405,6 +387,12 @@ const FONTS = [
 ];
 function fontStack(id){ const f = FONTS.find(f=>f.id===id); return f ? f.stack : FONTS[0].stack; }
 
+const THEME_COLORS = {
+  light:{bg:'#F6F1E3', text:'#2A241C', accent:'#8a5a3b'},
+  dark:{bg:'#1E1C19', text:'#E9E3D6', accent:'#d8a25a'},
+  paper:{bg:'#E9E2D2', text:'#2E2A20', accent:'#5f6f4e'}
+};
+
 /* ============================================================
    DOM refs
    ============================================================ */
@@ -412,8 +400,8 @@ const $ = sel => document.querySelector(sel);
 const libraryEl = $('#library'), readerEl = $('#reader');
 const shelfEl = $('#shelf'), libEmptyEl = $('#libEmpty');
 const fileInput = $('#fileInput');
-const scrollPane = $('#scrollPane'), scrollFlow = $('#scrollFlow');
-const pagePane = $('#pagePane'), pageViewport = $('#pageViewport'), pageTrack = $('#pageTrack');
+const scrollPane = $('#scrollPane');
+const pagePane = $('#pagePane'), pageViewport = $('#pageViewport');
 const rulerEl = $('#ruler');
 const settingsSheet = $('#settingsSheet'), scrim = $('#scrim');
 const tocSheet = $('#tocSheet'), tocList = $('#tocList');
@@ -428,10 +416,10 @@ let book = null; // current open book object
 /*
 book = {
   id, title, author, dir('ltr'|'rtl'),
-  chapters: [{ title, html, wordCount, dir }],
-  resourceUrls: [blobURLs to revoke],
-  pageLayout: { fontKey, width, height, perChapterPages:[n...], totalPages },
-  chapterIndex, pageIndex (within chapter), scrollFrac
+  epubBook: epub.js Book instance, rendition: epub.js Rendition instance,
+  navToc: [{label, href, index}],
+  currentCfi, currentHref, currentIndex, currentDisplayed:{page,total}, atStart, atEnd,
+  savedCfi, wordCounts:{counts:[...], total}, locationsReady
 }
 */
 
@@ -496,11 +484,11 @@ async function addBookFromFile(file, handle){
   loadingMsg.style.display = 'flex';
   showReader(); // temporary, so loading overlay is visible; will bounce back on failure
   try{
-    const parsed = await parseEpub(file);
+    const meta = await extractEpubMeta(file);
     const id = makeId(file.name, file.size);
     const entry = {
-      id, title: parsed.title || file.name.replace(/\.epub$/i,''), author: parsed.author || '',
-      coverDataUrl: parsed.coverDataUrl || null,
+      id, title: meta.title || file.name.replace(/\.epub$/i,''), author: meta.author || '',
+      coverDataUrl: meta.coverDataUrl || null,
       name: file.name, size: file.size, lastModified: file.lastModified,
       hasHandle: !!handle
     };
@@ -508,7 +496,6 @@ async function addBookFromFile(file, handle){
     if(existingIdx>=0) library[existingIdx] = entry; else library.push(entry);
     persistLibrary();
     if(handle){ await idbPut(id, handle); }
-    revokeBookUrls(parsed);
     loadingMsg.style.display = 'none';
     showLibrary();
   }catch(err){
@@ -571,24 +558,43 @@ async function openBookEntry(entry){
 
 async function loadBookFile(file, entry){
   try{
-    const parsed = await parseEpub(file);
+    const buf = await file.arrayBuffer();
+    const epubBook = ePub(buf);
+    await epubBook.ready;
+    const metadata = await epubBook.loaded.metadata;
+    const navigation = await epubBook.loaded.navigation;
+    const dir = detectDirection(metadata);
+
     book = {
-      id: entry.id, title: entry.title, author: entry.author,
-      dir: parsed.dir, chapters: parsed.chapters, resourceUrls: parsed.resourceUrls,
-      toc: parsed.toc,
-      pageLayout: null,
-      chapterIndex: 0, pageIndex: 0, scrollFrac: 0
+      id: entry.id, title: entry.title || metadata.title || file.name, author: entry.author || metadata.creator || '',
+      dir, epubBook, rendition: null,
+      navToc: buildNavToc(epubBook, navigation.toc),
+      currentCfi: null, currentHref: null, currentIndex: 0, currentDisplayed: null,
+      atStart:false, atEnd:false,
+      savedCfi: null,
+      wordCounts: null, locationsReady: false
     };
     const prog = progressMap[entry.id];
-    if(prog){
-      book.chapterIndex = Math.min(prog.chapterIndex||0, book.chapters.length-1);
-      book.pageIndex = prog.pageIndex||0;
-      book.scrollFrac = prog.scrollFrac||0;
-    }
+    if(prog && prog.cfi) book.savedCfi = prog.cfi;
+
     topTitle.textContent = book.title;
     $('#grantPermBtn').textContent = 'Grant Access';
     loadingMsg.style.display = 'none';
     initReaderView();
+
+    // background: word counts (for time estimates) + locations (for percent/page-of-book)
+    computeWordCounts(epubBook).then(res=>{ if(book && book.epubBook===epubBook){ book.wordCounts = res; updateBottomBar(); } }).catch(()=>{});
+    const savedLocs = prog && prog.locations;
+    (savedLocs ? Promise.resolve(epubBook.locations.load(savedLocs)) : epubBook.locations.generate(1600))
+      .then(()=>{
+        if(!book || book.epubBook!==epubBook) return;
+        book.locationsReady = true;
+        updateBottomBar();
+        try{
+          progressMap[entry.id] = Object.assign({}, progressMap[entry.id], {locations: epubBook.locations.save()});
+          persistProgress();
+        }catch(e){}
+      }).catch(()=>{});
   }catch(err){
     console.error(err);
     loadingMsg.style.display = 'none';
@@ -597,161 +603,52 @@ async function loadBookFile(file, entry){
   }
 }
 
-function revokeBookUrls(b){
-  if(b && b.resourceUrls){ b.resourceUrls.forEach(u=>{ try{URL.revokeObjectURL(u);}catch(e){} }); }
+function detectDirection(metadata){
+  const language = (metadata.language||'').toLowerCase();
+  const metaDir = (metadata.direction||'').toLowerCase();
+  if(metaDir==='rtl') return 'rtl';
+  if(metaDir==='ltr') return 'ltr';
+  return /^he|^iw|^ar|^fa|^ur/.test(language) ? 'rtl' : 'ltr';
+}
+
+function buildNavToc(epubBook, items, depth){
+  depth = depth || 0;
+  let out = [];
+  (items||[]).forEach(item=>{
+    let idx = null;
+    try{ const s = epubBook.spine.get(item.href); idx = s ? s.index : null; }catch(e){}
+    out.push({ label: (depth>0?'  '.repeat(depth):'') + (item.label||'').trim(), href: item.href, index: idx });
+    if(item.subitems && item.subitems.length) out = out.concat(buildNavToc(epubBook, item.subitems, depth+1));
+  });
+  return out;
 }
 
 /* ============================================================
-   EPUB Parsing
+   EPUB metadata-only extraction (for library cards)
    ============================================================ */
-async function parseEpub(file){
+async function extractEpubMeta(file){
   const buf = await file.arrayBuffer();
-  const zip = await JSZip.loadAsync(buf);
-
-  const containerXml = await zip.file('META-INF/container.xml').async('string');
-  const containerDoc = new DOMParser().parseFromString(containerXml, 'application/xml');
-  const opfPath = containerDoc.querySelector('rootfile').getAttribute('full-path');
-  const opfDir = opfPath.includes('/') ? opfPath.slice(0, opfPath.lastIndexOf('/')+1) : '';
-
-  const opfXml = await zip.file(opfPath).async('string');
-  const opf = new DOMParser().parseFromString(opfXml, 'application/xml');
-
-  const title = (opf.querySelector('metadata > title, dc\\:title')||{}).textContent || '';
-  const author = (opf.querySelector('metadata > creator, dc\\:creator')||{}).textContent || '';
-  const language = ((opf.querySelector('metadata > language, dc\\:language')||{}).textContent || '').toLowerCase();
-  const bookDirAttr = (opf.documentElement.getAttribute('dir')||'').toLowerCase();
-  let bookIsRTL = bookDirAttr==='rtl' || /^he|^iw|^ar|^fa|^ur/.test(language);
-
-  const manifest = {}; // id -> {href, mediaType, properties}
-  opf.querySelectorAll('manifest > item').forEach(item=>{
-    manifest[item.getAttribute('id')] = {
-      href: decodeURIComponent(item.getAttribute('href')),
-      mediaType: item.getAttribute('media-type')||'',
-      properties: item.getAttribute('properties')||''
-    };
-  });
-  const spineIds = [...opf.querySelectorAll('spine > itemref')].map(x=>x.getAttribute('idref'));
-
-  function resolvePath(href, baseDir){
-    if(/^https?:\/\//.test(href)) return href;
-    const parts = (baseDir + href).split('/');
-    const out = [];
-    for(const p of parts){
-      if(p==='.'||p==='') continue;
-      if(p==='..') out.pop(); else out.push(p);
-    }
-    return out.join('/');
-  }
-
-  // Build blob URL cache for all binary resources (images) referenced anywhere
-  const resourceUrls = [];
-  const pathToUrl = {};
-  async function getResourceUrl(path){
-    if(pathToUrl[path]) return pathToUrl[path];
-    const f = zip.file(path);
-    if(!f) return null;
-    const mt = guessMime(path);
-    const blob = await f.async('blob');
-    const typedBlob = mt ? new Blob([blob], {type:mt}) : blob;
-    const url = URL.createObjectURL(typedBlob);
-    pathToUrl[path] = url;
-    resourceUrls.push(url);
-    return url;
-  }
-  function guessMime(path){
-    const ext = path.split('.').pop().toLowerCase();
-    return ({
-      jpg:'image/jpeg',jpeg:'image/jpeg',png:'image/png',gif:'image/gif',
-      svg:'image/svg+xml',webp:'image/webp',bmp:'image/bmp'
-    })[ext] || '';
-  }
-
-  // Cover
+  const epubBook = ePub(buf);
+  await epubBook.ready;
+  const metadata = await epubBook.loaded.metadata;
   let coverDataUrl = null;
   try{
-    let coverHref = null;
-    const coverMeta = [...opf.querySelectorAll('metadata > meta')].find(m=>m.getAttribute('name')==='cover');
-    if(coverMeta){
-      const id = coverMeta.getAttribute('content');
-      if(manifest[id]) coverHref = manifest[id].href;
-    }
-    if(!coverHref){
-      const item = Object.values(manifest).find(m=>/cover-image/.test(m.properties));
-      if(item) coverHref = item.href;
-    }
-    if(!coverHref){
-      const item = Object.values(manifest).find(m=>/cover/i.test(m.href) && /image/.test(m.mediaType));
-      if(item) coverHref = item.href;
-    }
-    if(coverHref){
-      const path = resolvePath(coverHref, opfDir);
-      const f = zip.file(path);
-      if(f){
-        const blob = await f.async('blob');
-        coverDataUrl = await blobToDataUrl(new Blob([blob], {type: guessMime(path)||'image/jpeg'}));
-      }
+    const coverUrl = await epubBook.coverUrl();
+    if(coverUrl){
+      const resp = await fetch(coverUrl);
+      const blob = await resp.blob();
+      coverDataUrl = await blobToDataUrl(blob);
+      URL.revokeObjectURL(coverUrl);
     }
   }catch(e){ console.warn('cover extraction failed', e); }
-
-  // Chapters
-  const chapters = [];
-  for(const id of spineIds){
-    const item = manifest[id];
-    if(!item) continue;
-    const path = resolvePath(item.href, opfDir);
-    const chapDir = path.includes('/') ? path.slice(0, path.lastIndexOf('/')+1) : '';
-    const f = zip.file(path);
-    if(!f) continue;
-    let html = await f.async('string');
-    const doc = new DOMParser().parseFromString(html, 'text/html');
-
-    doc.querySelectorAll('script,style,link[rel=stylesheet]').forEach(n=>n.remove());
-    doc.querySelectorAll('*').forEach(n=>{ n.removeAttribute('style'); n.removeAttribute('class'); });
-
-    // resolve images
-    const imgs = [...doc.querySelectorAll('img,image')];
-    for(const img of imgs){
-      const attr = img.tagName.toLowerCase()==='image' ? 'xlink:href' : 'src';
-      let src = img.getAttribute(attr) || img.getAttribute('src') || img.getAttribute('href');
-      if(!src) continue;
-      const p = resolvePath(src, chapDir);
-      const url = await getResourceUrl(p);
-      if(url){
-        if(img.tagName.toLowerCase()==='image'){ img.setAttribute('href', url); img.setAttribute('xlink:href', url); }
-        else img.setAttribute('src', url);
-      }
-    }
-
-    let chapTitle = '';
-    const h = doc.querySelector('h1,h2,h3,title');
-    if(h) chapTitle = h.textContent.trim().slice(0,80);
-
-    const htmlDirAttr = (doc.documentElement.getAttribute('dir') || (doc.body && doc.body.getAttribute('dir')) || '').toLowerCase();
-    const text = (doc.body ? doc.body.textContent : '') || '';
-    let isRTL = bookIsRTL;
-    if(htmlDirAttr==='rtl') isRTL = true;
-    else if(htmlDirAttr==='ltr') isRTL = false;
-    else {
-      const heCount = (text.match(/[\u0590-\u05FF]/g)||[]).length;
-      if(heCount > text.length*0.15) isRTL = true;
-    }
-    const wordCount = (text.trim().match(/\S+/g)||[]).length;
-
-    chapters.push({
-      title: chapTitle || ('Chapter '+(chapters.length+1)),
-      html: doc.body ? doc.body.innerHTML : '',
-      dir: isRTL ? 'rtl':'ltr',
-      wordCount
-    });
-  }
-
-  const toc = chapters.map((c,i)=>({index:i, title:c.title}));
-
-  return {
-    title: title.trim(), author: author.trim(),
-    dir: bookIsRTL ? 'rtl':'ltr',
-    chapters, toc, coverDataUrl, resourceUrls
+  const result = {
+    title: (metadata.title||'').trim(),
+    author: (metadata.creator||'').trim(),
+    coverDataUrl,
+    dir: detectDirection(metadata)
   };
+  try{ epubBook.destroy(); }catch(e){}
+  return result;
 }
 
 function blobToDataUrl(blob){
@@ -764,187 +661,141 @@ function blobToDataUrl(blob){
 }
 
 /* ============================================================
-   Reader view: rendering, pagination, scroll
+   Word counts (background, powers the time-remaining status modes)
+   ============================================================ */
+async function computeWordCounts(epubBook){
+  const counts = [];
+  let total = 0;
+  for(const item of epubBook.spine.spineItems){
+    try{
+      await item.load(epubBook.load.bind(epubBook));
+      const text = (item.document && item.document.body) ? item.document.body.textContent : '';
+      const wc = (text.trim().match(/\S+/g)||[]).length;
+      counts.push(wc); total += wc;
+      item.unload();
+    }catch(e){ counts.push(0); }
+  }
+  return {counts, total};
+}
+
+/* ============================================================
+   Reader view: rendering via epub.js
    ============================================================ */
 function applyTypography(){
   document.body.setAttribute('data-theme', settings.theme);
+}
+
+const GOOGLE_FONTS_URL = "https://fonts.googleapis.com/css2?family=Literata:ital,wght@0,400;0,500;0,700;1,400&family=Roboto+Slab:wght@400;500;700&family=Lora:ital,wght@0,400;0,600;1,400&family=Rubik:wght@400;500;700&family=Frank+Ruhl+Libre:wght@400;500;700&family=Noto+Sans+Hebrew:wght@400;600&family=Noto+Serif+Hebrew:wght@400;700&display=swap";
+
+function injectDynamicStyle(contents){
+  if(!contents || !contents.document) return;
+  const doc = contents.document;
+  // book content renders inside its own iframe document, so custom
+  // webfonts need to be loaded there too (they don't inherit from the parent page)
+  try{ contents.addStylesheet(GOOGLE_FONTS_URL); }catch(e){}
+  const theme = THEME_COLORS[settings.theme] || THEME_COLORS.light;
   const stack = fontStack(settings.font);
-  const style = document.createElement('style');
   const css = `
-    .reader-text{
-      font-family:${stack};
-      font-size:${settings.fontSize}px;
-      line-height:${settings.lineHeight};
-      letter-spacing:${settings.letterSpacing}px;
+    html, body{ background:${theme.bg} !important; color:${theme.text} !important; margin:0; }
+    body, p, div, span, li, td{
+      font-family:${stack} !important;
+      font-size:${settings.fontSize}px !important;
+      line-height:${settings.lineHeight} !important;
+      letter-spacing:${settings.letterSpacing}px !important;
     }
-    .reader-text p{ margin-bottom:${settings.paraSpacing}em; }
+    p{ margin:0 0 ${settings.paraSpacing}em !important; text-align:justify; text-wrap:pretty; orphans:2; widows:2; }
+    h1,h2,h3{ line-height:1.3; margin:.6em 0 .5em; }
+    hr{ border:none; border-top:1px solid ${theme.text}22; margin:2em 0; }
+    a{ color:${theme.accent}; }
+    img, svg{ max-width:100%; height:auto; }
   `;
-  let tag = document.getElementById('dynStyle');
-  if(!tag){ tag = document.createElement('style'); tag.id='dynStyle'; document.head.appendChild(tag); }
-  tag.textContent = css;
+  let styleEl = doc.getElementById('reader-dyn-style');
+  if(!styleEl){
+    styleEl = doc.createElement('style');
+    styleEl.id = 'reader-dyn-style';
+    doc.head.appendChild(styleEl);
+  }
+  styleEl.textContent = css;
 }
 
 function initReaderView(){
   applyTypography();
   updateViewModeUI();
   updateRulerPosition();
-  renderTOC();
-  if(settings.viewMode==='scroll'){ renderScrollMode(); }
-  else { renderPageMode(); }
-  updateBottomBar();
-  saveProgressDebounced();
-  // fonts may still be loading on first paint; re-measure pagination once they're ready
-  if(document.fonts && document.fonts.ready){
-    document.fonts.ready.then(()=>{
-      if(book && settings.viewMode==='page') buildPagination();
-    });
-  }
-}
-
-/* ---------- Scroll mode ---------- */
-function renderScrollMode(){
-  scrollPane.style.display='block'; pagePane.style.display='none';
-  scrollFlow.setAttribute('dir', book.dir);
-  scrollFlow.innerHTML = book.chapters.map((c,i)=>
-    `<section data-chapter="${i}">${c.html}</section>`
-  ).join('<hr>');
-
-  // restore position
-  requestAnimationFrame(()=>{
-    const total = scrollPane.scrollHeight - scrollPane.clientHeight;
-    scrollPane.scrollTop = Math.max(0, book.scrollFrac * total);
-  });
-
-  scrollPane.onscroll = throttle(()=>{
-    const total = scrollPane.scrollHeight - scrollPane.clientHeight;
-    book.scrollFrac = total>0 ? scrollPane.scrollTop/total : 0;
-    // figure current chapter by section offsets
-    const sections = [...scrollFlow.querySelectorAll('section')];
-    let idx = 0;
-    for(let i=0;i<sections.length;i++){
-      if(sections[i].offsetTop <= scrollPane.scrollTop + 40) idx = i;
-    }
-    book.chapterIndex = idx;
-    updateBottomBar();
-    saveProgressDebounced();
-  }, 120);
-}
-
-/* ---------- Page mode ---------- */
-let pageResizeObserver = null;
-function renderPageMode(){
-  scrollPane.style.display='none'; pagePane.style.display='block';
-  buildPagination();
-}
-
-function buildPagination(){
-  const vw = pageViewport.clientWidth;
-  const vh = pageViewport.clientHeight;
-  if(vw===0||vh===0){ return; }
-  const gap = 60;
-
-  pageTrack.innerHTML = '';
-  pageTrack.style.width = (vw*book.chapters.length)+'px'; // temp, will size per chapter below (each chapter is its own host at chapterX*vw)
-
-  const hosts = [];
-  book.chapters.forEach((c, i)=>{
-    const host = document.createElement('div');
-    host.className = 'page-col-host';
-    host.style.left = (i*vw)+'px';
-    host.style.width = vw+'px';
-    host.style.position = 'absolute';
-    host.style.top = '0'; host.style.height = vh+'px';
-    host.innerHTML = `<div class="inner reader-text" dir="${c.dir}" style="column-width:${vw - 60}px;">${c.html}</div>`;
-    pageTrack.appendChild(host);
-    hosts.push(host);
-  });
-  pageTrack.style.width = (vw*book.chapters.length)+'px';
-
-  // measure page counts per chapter
-  requestAnimationFrame(()=>{
-    const perChapterPages = hosts.map(h=>{
-      const inner = h.querySelector('.inner');
-      const colWidth = vw - 60; // padding approx handled by host padding
-      const advance = colWidth + gap;
-      const pages = Math.max(1, Math.round(inner.scrollWidth / advance));
-      return pages;
-    });
-    book.pageLayout = {
-      vw, vh, gap, perChapterPages,
-      totalPages: perChapterPages.reduce((a,b)=>a+b,0),
-      chapterAdvance: vw
-    };
-    book.pageIndex = Math.min(book.pageIndex, perChapterPages[book.chapterIndex]-1 || 0);
-    goToPage(book.chapterIndex, book.pageIndex, false);
-    updateBottomBar();
-  });
-}
-
-function pageColAdvance(){
-  if(!book.pageLayout) return 0;
-  return (book.pageLayout.vw - 60) + book.pageLayout.gap;
-}
-
-function goToPage(chapterIndex, pageIndex, animate){
-  if(!book.pageLayout) return;
-  chapterIndex = Math.max(0, Math.min(chapterIndex, book.chapters.length-1));
-  const maxPage = (book.pageLayout.perChapterPages[chapterIndex]||1)-1;
-  pageIndex = Math.max(0, Math.min(pageIndex, maxPage));
-  book.chapterIndex = chapterIndex;
-  book.pageIndex = pageIndex;
-
-  const dir = book.chapters[chapterIndex].dir;
-  const sign = dir==='rtl' ? 1 : -1;
-  const chapterOffsetPx = chapterIndex * book.pageLayout.vw;
-  const withinChapterOffset = sign * pageIndex * pageColAdvance();
-  // Chapters always advance left-to-right in track order regardless of a
-  // chapter's own text direction; only within-chapter page movement flips.
-  const totalOffset = -chapterOffsetPx + withinChapterOffset;
-
-  pageTrack.classList.toggle('animating', !!(animate && settings.pageAnim));
-  pageTrack.style.transform = `translateX(${totalOffset}px)`;
-
+  mountRendition();
   updateBottomBar();
   saveProgressDebounced();
 }
 
-function pageNext(){
-  if(!book.pageLayout) return;
-  const maxPage = (book.pageLayout.perChapterPages[book.chapterIndex]||1)-1;
-  if(book.pageIndex < maxPage){ goToPage(book.chapterIndex, book.pageIndex+1, true); }
-  else if(book.chapterIndex < book.chapters.length-1){ goToPage(book.chapterIndex+1, 0, true); }
+function createRendition(container, mode){
+  const opts = mode==='page'
+    ? { width:'100%', height:'100%', manager:'default', flow:'paginated', spread:'none', minSpreadWidth:9999, allowScriptedContent:false }
+    : { width:'100%', height:'100%', manager:'continuous', flow:'scrolled', allowScriptedContent:false };
+  const rendition = book.epubBook.renderTo(container, opts);
+  rendition.hooks.content.register(injectDynamicStyle);
+  rendition.on('relocated', onRelocated);
+  return rendition;
 }
-function pagePrev(){
-  if(!book.pageLayout) return;
-  if(book.pageIndex > 0){ goToPage(book.chapterIndex, book.pageIndex-1, true); }
-  else if(book.chapterIndex > 0){
-    const prevMax = (book.pageLayout.perChapterPages[book.chapterIndex-1]||1)-1;
-    goToPage(book.chapterIndex-1, prevMax, true);
+
+function mountRendition(){
+  if(book.rendition){ try{ book.rendition.destroy(); }catch(e){} book.rendition = null; }
+  scrollPane.style.display = settings.viewMode==='scroll' ? 'block':'none';
+  pagePane.style.display = settings.viewMode==='page' ? 'block':'none';
+  const containerEl = settings.viewMode==='scroll' ? scrollPane : pageViewport;
+  containerEl.innerHTML = '';
+  book.rendition = createRendition(containerEl, settings.viewMode);
+  const startAt = book.currentCfi || book.savedCfi || undefined;
+  book.rendition.display(startAt);
+}
+
+function onRelocated(location){
+  if(!book) return;
+  book.currentCfi = location.start.cfi;
+  book.currentHref = location.start.href;
+  book.currentIndex = location.start.index;
+  book.currentDisplayed = location.start.displayed || null;
+  book.atStart = !!location.atStart;
+  book.atEnd = !!location.atEnd;
+  updateBottomBar();
+  saveProgressDebounced();
+  if(tocSheet.classList.contains('open')) renderTOC();
+}
+
+function reflowCurrent(){
+  if(!book || !book.rendition) return;
+  const r = book.rendition;
+  r.getContents().forEach(injectDynamicStyle);
+  if(settings.viewMode==='page' && book.currentCfi){
+    r.display(book.currentCfi);
   }
 }
+
+/* ---------- Page navigation (tap zones + swipe) ---------- */
+function isRTL(){ return !!(book && book.dir==='rtl'); }
 
 $('#tapLeft').addEventListener('click', ()=>{
-  if(book.dir==='rtl') pageNext(); else pagePrev();
+  if(!book || !book.rendition) return;
+  if(isRTL()) book.rendition.next(); else book.rendition.prev();
 });
 $('#tapRight').addEventListener('click', ()=>{
-  if(book.dir==='rtl') pagePrev(); else pageNext();
+  if(!book || !book.rendition) return;
+  if(isRTL()) book.rendition.prev(); else book.rendition.next();
 });
 
-// swipe support
 let touchStartX = null;
 pagePane.addEventListener('touchstart', e=>{ touchStartX = e.touches[0].clientX; }, {passive:true});
 pagePane.addEventListener('touchend', e=>{
-  if(touchStartX===null) return;
+  if(touchStartX===null || !book || !book.rendition) return;
   const dx = e.changedTouches[0].clientX - touchStartX;
   touchStartX = null;
   if(Math.abs(dx) < 40) return;
   const swipeLeft = dx < 0;
-  const goNext = book.dir==='rtl' ? !swipeLeft : swipeLeft;
-  if(goNext) pageNext(); else pagePrev();
+  const goNext = isRTL() ? !swipeLeft : swipeLeft;
+  if(goNext) book.rendition.next(); else book.rendition.prev();
 });
 
 window.addEventListener('resize', debounce(()=>{
-  if(book && settings.viewMode==='page'){ buildPagination(); }
+  updateRulerPosition();
 }, 200));
 
 /* ---------- View mode switching ---------- */
@@ -959,7 +810,7 @@ $('#viewSeg').addEventListener('click', e=>{
   persistSettings();
   updateViewModeUI();
   if(!book) return;
-  if(settings.viewMode==='scroll') renderScrollMode(); else renderPageMode();
+  mountRendition();
 });
 
 /* ============================================================
@@ -970,37 +821,36 @@ const STATUS_MODES = [
 ];
 
 function currentPercent(){
-  if(settings.viewMode==='scroll'){
-    // percent by words read across chapters (scrollFrac approximates position within current chapter)
-    const totalWords = book.chapters.reduce((a,c)=>a+c.wordCount,0) || 1;
-    let before = 0;
-    for(let i=0;i<book.chapterIndex;i++) before += book.chapters[i].wordCount;
-    const curWords = book.chapters[book.chapterIndex] ? book.chapters[book.chapterIndex].wordCount : 0;
-    return Math.min(1, (before + book.scrollFrac*curWords) / totalWords);
-  } else {
-    if(!book.pageLayout) return 0;
-    let before = 0;
-    for(let i=0;i<book.chapterIndex;i++) before += book.pageLayout.perChapterPages[i];
-    before += book.pageIndex;
-    return Math.min(1, (before+1) / book.pageLayout.totalPages);
+  if(!book) return 0;
+  if(book.locationsReady && book.currentCfi){
+    try{ return book.epubBook.locations.percentageFromCfi(book.currentCfi); }catch(e){}
   }
+  const total = (book.epubBook.spine && book.epubBook.spine.length) || 1;
+  let frac = (book.currentIndex||0)/total;
+  if(book.currentDisplayed && book.currentDisplayed.total){
+    frac += (1/total) * ((book.currentDisplayed.page-1)/book.currentDisplayed.total);
+  }
+  return Math.max(0, Math.min(1, frac));
 }
 
 function wordsRemainingInChapter(){
-  const c = book.chapters[book.chapterIndex];
-  if(settings.viewMode==='page' && book.pageLayout){
-    const maxPage = book.pageLayout.perChapterPages[book.chapterIndex]||1;
-    const frac = 1 - (book.pageIndex+1)/maxPage;
-    return Math.round(c.wordCount * Math.max(0,frac));
+  if(!book || !book.wordCounts) return null;
+  const idx = book.currentIndex||0;
+  let curFrac = 1;
+  if(book.currentDisplayed && book.currentDisplayed.total){
+    curFrac = 1 - (book.currentDisplayed.page/book.currentDisplayed.total);
   }
-  return Math.round(c.wordCount * (1-book.scrollFrac));
+  return Math.round((book.wordCounts.counts[idx]||0) * curFrac);
 }
 function wordsRemainingInBook(){
-  let rem = wordsRemainingInChapter();
-  for(let i=book.chapterIndex+1;i<book.chapters.length;i++) rem += book.chapters[i].wordCount;
+  if(!book || !book.wordCounts) return null;
+  const idx = book.currentIndex||0;
+  let rem = wordsRemainingInChapter() || 0;
+  for(let i=idx+1;i<book.wordCounts.counts.length;i++) rem += book.wordCounts.counts[i];
   return rem;
 }
 function fmtTime(words){
+  if(words==null) return null;
   const mins = words / settings.wpm;
   if(mins < 1) return '<1 min';
   if(mins < 60) return Math.round(mins)+' min';
@@ -1010,7 +860,6 @@ function fmtTime(words){
 
 function updateBottomBar(){
   if(!book) return;
-  // percent
   const pct = Math.round(currentPercent()*100);
   statusRight.textContent = pct+'%';
   statusRight.classList.toggle('hidden-pct', !settings.percentVisible);
@@ -1020,28 +869,35 @@ function updateBottomBar(){
   switch(mode){
     case 'none': text=''; break;
     case 'pageInBook':
-      if(settings.viewMode==='page' && book.pageLayout){
-        let before=0; for(let i=0;i<book.chapterIndex;i++) before+=book.pageLayout.perChapterPages[i];
-        text = `Page ${before+book.pageIndex+1} of ${book.pageLayout.totalPages}`;
-      } else text = 'Page view only';
+      if(book.locationsReady && book.currentCfi){
+        const loc = book.epubBook.locations.locationFromCfi(book.currentCfi);
+        text = `Location ${loc+1} of ${book.epubBook.locations.total}`;
+      } else text = 'Calculating…';
       break;
     case 'pageInChapter':
-      if(settings.viewMode==='page' && book.pageLayout){
-        text = `Page ${book.pageIndex+1} of ${book.pageLayout.perChapterPages[book.chapterIndex]} (chapter)`;
+      if(settings.viewMode==='page' && book.currentDisplayed){
+        text = `Page ${book.currentDisplayed.page} of ${book.currentDisplayed.total} (chapter)`;
       } else text = 'Page view only';
       break;
-    case 'timeInBook': text = fmtTime(wordsRemainingInBook())+' left in book'; break;
-    case 'timeInChapter': text = fmtTime(wordsRemainingInChapter())+' left in chapter'; break;
+    case 'timeInBook': {
+      const t = fmtTime(wordsRemainingInBook());
+      text = t ? (t+' left in book') : 'Calculating…';
+      break;
+    }
+    case 'timeInChapter': {
+      const t = fmtTime(wordsRemainingInChapter());
+      text = t ? (t+' left in chapter') : 'Calculating…';
+      break;
+    }
     case 'flipsInBook':
-      if(settings.viewMode==='page' && book.pageLayout){
-        let before=0; for(let i=0;i<book.chapterIndex;i++) before+=book.pageLayout.perChapterPages[i];
-        const cur = before+book.pageIndex;
-        text = (book.pageLayout.totalPages-cur-1)+' flips left in book';
-      } else text = 'Switch to page view';
+      if(book.locationsReady && book.currentCfi){
+        const loc = book.epubBook.locations.locationFromCfi(book.currentCfi);
+        text = (book.epubBook.locations.total-loc-1)+' locations left in book';
+      } else text = 'Calculating…';
       break;
     case 'flipsInChapter':
-      if(settings.viewMode==='page' && book.pageLayout){
-        text = (book.pageLayout.perChapterPages[book.chapterIndex]-book.pageIndex-1)+' flips left in chapter';
+      if(settings.viewMode==='page' && book.currentDisplayed){
+        text = (book.currentDisplayed.total-book.currentDisplayed.page)+' flips left in chapter';
       } else text = 'Switch to page view';
       break;
   }
@@ -1113,6 +969,7 @@ document.querySelectorAll('.swatch').forEach(sw=>{
     persistSettings();
     applyTypography();
     refreshSettingsUI();
+    if(book) reflowCurrent();
   });
 });
 
@@ -1123,20 +980,20 @@ FONTS.forEach(f=>{
   div.dataset.id = f.id;
   div.innerHTML = `<span>${f.label}</span><span style="font-family:${f.stack};font-size:19px;">${f.sample}</span>`;
   div.addEventListener('click', ()=>{
-    settings.font = f.id; persistSettings(); applyTypography(); refreshSettingsUI();
-    if(book && settings.viewMode==='page') buildPagination();
+    settings.font = f.id; persistSettings(); refreshSettingsUI();
+    if(book) reflowCurrent();
   });
   fontListEl.appendChild(div);
 });
 
-function bindRange(id, key, fmt, after){
+function bindRange(id, key, fmt, after, needsReflow){
+  if(needsReflow === undefined) needsReflow = true;
   const el = $(id);
   el.addEventListener('input', ()=>{
     settings[key] = parseFloat(el.value);
     persistSettings();
     document.getElementById(id.slice(1).replace('Range','Val')).textContent = fmt ? fmt(settings[key]) : settings[key];
-    applyTypography();
-    if(book && settings.viewMode==='page') buildPagination();
+    if(needsReflow && book) reflowCurrent();
     if(after) after();
   });
 }
@@ -1144,7 +1001,7 @@ bindRange('#sizeRange','fontSize', v=>v);
 bindRange('#lineRange','lineHeight', v=>v.toFixed(1), updateRulerPosition);
 bindRange('#letterRange','letterSpacing', v=>v.toFixed(1));
 bindRange('#paraRange','paraSpacing', v=>v.toFixed(1));
-bindRange('#wpmRange','wpm', v=>Math.round(v), updateBottomBar);
+bindRange('#wpmRange','wpm', v=>Math.round(v), updateBottomBar, false);
 
 $('#animToggle').addEventListener('click', ()=>{
   settings.pageAnim = !settings.pageAnim;
@@ -1160,7 +1017,8 @@ $('#removeBookBtn').addEventListener('click', ()=>{
   persistLibrary(); persistProgress();
   idbDelete(book.id).catch(()=>{});
   closeSettings();
-  revokeBookUrls(book);
+  try{ if(book.rendition) book.rendition.destroy(); }catch(e){}
+  try{ book.epubBook.destroy(); }catch(e){}
   book = null;
   showLibrary();
 });
@@ -1183,17 +1041,13 @@ refreshSettingsUI();
    ============================================================ */
 function renderTOC(){
   tocList.innerHTML = '';
-  book.toc.forEach(entry=>{
+  (book.navToc||[]).forEach(entry=>{
     const div = document.createElement('div');
-    div.className = 'toc-item'+(entry.index===book.chapterIndex?' current':'');
-    div.textContent = entry.title;
+    div.className = 'toc-item'+((entry.index!=null && entry.index===book.currentIndex)?' current':'');
+    div.textContent = entry.label;
     div.addEventListener('click', ()=>{
       closeTOC();
-      if(settings.viewMode==='page'){ goToPage(entry.index, 0, false); }
-      else {
-        const section = scrollFlow.querySelector(`section[data-chapter="${entry.index}"]`);
-        if(section) scrollPane.scrollTop = section.offsetTop;
-      }
+      book.rendition.display(entry.href);
     });
     tocList.appendChild(div);
   });
@@ -1208,19 +1062,20 @@ $('#tocCloseBtn').addEventListener('click', closeTOC);
    ============================================================ */
 $('#backBtn').addEventListener('click', ()=>{
   saveProgress();
-  if(book) revokeBookUrls(book);
+  if(book){
+    try{ if(book.rendition) book.rendition.destroy(); }catch(e){}
+    try{ book.epubBook.destroy(); }catch(e){}
+  }
   book = null;
   showLibrary();
 });
 
 function saveProgress(){
   if(!book) return;
-  progressMap[book.id] = {
-    chapterIndex: book.chapterIndex,
-    pageIndex: book.pageIndex,
-    scrollFrac: book.scrollFrac,
+  progressMap[book.id] = Object.assign({}, progressMap[book.id], {
+    cfi: book.currentCfi || book.savedCfi || null,
     percent: currentPercent()
-  };
+  });
   persistProgress();
 }
 const saveProgressDebounced = debounce(saveProgress, 400);
@@ -1229,7 +1084,6 @@ const saveProgressDebounced = debounce(saveProgress, 400);
    Utils
    ============================================================ */
 function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
-function throttle(fn, ms){ let last=0, t; return (...a)=>{ const now=Date.now(); if(now-last>ms){ last=now; fn(...a);} else { clearTimeout(t); t=setTimeout(()=>{last=Date.now(); fn(...a);}, ms-(now-last)); } }; }
 
 /* ============================================================
    Init
