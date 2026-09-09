@@ -103,6 +103,10 @@ body[data-theme="paper"] #app{
 .tap-zone{position:absolute;top:0;bottom:0;width:22%;z-index:5;}
 .tap-zone.left{left:0;}
 .tap-zone.right{right:0;}
+/* top/bottom tap-layout variant: same edge strips, split into a small
+   back zone up top and a larger forward zone below (display toggled by JS) */
+.tap-zone.top{bottom:auto;height:30%;display:none;}
+.tap-zone.bottom{top:auto;height:70%;display:none;}
 
 /* ruler */
 #ruler{
@@ -213,6 +217,10 @@ input[type=range]{width:100%;accent-color:var(--accent);}
         <div id="pageViewport"></div>
         <div class="tap-zone left" id="tapLeft"></div>
         <div class="tap-zone right" id="tapRight"></div>
+        <div class="tap-zone left top" id="tapLeftTop"></div>
+        <div class="tap-zone left bottom" id="tapLeftBottom"></div>
+        <div class="tap-zone right top" id="tapRightTop"></div>
+        <div class="tap-zone right bottom" id="tapRightBottom"></div>
       </div>
 
       <div id="ruler"><div class="handle"></div></div>
@@ -268,6 +276,14 @@ input[type=range]{width:100%;accent-color:var(--accent);}
     </div>
 
     <div class="setting-group">
+      <h4>Tap zones</h4>
+      <div class="toggle-row">
+        <label>Top/bottom page turns</label>
+        <div class="switch" id="tapLayoutSwitch"><i></i></div>
+      </div>
+    </div>
+
+    <div class="setting-group">
       <h4>View mode</h4>
       <div class="seg" id="viewSeg">
         <button data-v="page">Single page</button>
@@ -317,7 +333,7 @@ function saveJSON(key, val){
 
 const DEFAULT_SETTINGS = {
   theme:'light', font:'literata', fontSize:18, lineHeight:1.7, letterSpacing:0, paraSpacing:1,
-  viewMode:'page', percentVisible:true, statusMode:1, rulerOn:false, rulerPos:0.42, wpm:230
+  viewMode:'page', percentVisible:true, statusMode:1, rulerOn:false, rulerPos:0.42, wpm:230, tapLayout:'sides'
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS_SETTINGS, {}));
 let library = loadJSON(LS_LIB, []); // [{id,title,author,coverDataUrl,name,size,lastModified,hasHandle}]
@@ -806,20 +822,43 @@ function reflowCurrent(){
 /* ---------- Page navigation (tap zones + swipe, works anywhere on the page) ---------- */
 function isRTL(){ return !!(book && book.dir==='rtl'); }
 
-// visualDir is the physical/on-screen direction the gesture implies ('left' or 'right'),
-// independent of reading direction — RTL vs LTR only changes which epub.js call it maps to,
-// so a left swipe/tap always *looks* like a left-moving turn, in either language.
-function turnPage(visualDir){
+// turnPageAbs takes an absolute forward(true)/back(false) direction in reading order.
+function turnPageAbs(goNext){
   if(!book || !book.rendition) return;
-  const goNext = (visualDir==='left') ? !isRTL() : isRTL();
   if(goNext && book.atEnd) return;
   if(!goNext && book.atStart) return;
   if(goNext) book.rendition.next(); else book.rendition.prev();
 }
 
+// visualDir is the physical/on-screen direction the gesture implies ('left' or 'right'),
+// independent of reading direction — RTL vs LTR only changes which epub.js call it maps to,
+// so a left swipe/tap always *looks* like a left-moving turn, in either language.
+function turnPage(visualDir){
+  if(!book || !book.rendition) return;
+  turnPageAbs((visualDir==='left') ? !isRTL() : isRTL());
+}
+
 let suppressTapClick = false;
+// "sides" layout: left edge = back, right edge = forward (mirrored under RTL by turnPage)
 $('#tapLeft').addEventListener('click', ()=>{ if(!suppressTapClick) turnPage('right'); });
 $('#tapRight').addEventListener('click', ()=>{ if(!suppressTapClick) turnPage('left'); });
+// "top/bottom" layout: on either edge strip, the bottom 70% turns forward and the
+// top 30% goes back — direction is absolute (not affected by RTL), since it's driven
+// by vertical position rather than which side of the screen was tapped.
+$('#tapLeftBottom').addEventListener('click', ()=>{ if(!suppressTapClick) turnPageAbs(true); });
+$('#tapRightBottom').addEventListener('click', ()=>{ if(!suppressTapClick) turnPageAbs(true); });
+$('#tapLeftTop').addEventListener('click', ()=>{ if(!suppressTapClick) turnPageAbs(false); });
+$('#tapRightTop').addEventListener('click', ()=>{ if(!suppressTapClick) turnPageAbs(false); });
+
+function updateTapZoneLayout(){
+  const topBottom = settings.tapLayout === 'topBottom';
+  $('#tapLeft').style.display = topBottom ? 'none' : '';
+  $('#tapRight').style.display = topBottom ? 'none' : '';
+  $('#tapLeftTop').style.display = topBottom ? '' : 'none';
+  $('#tapLeftBottom').style.display = topBottom ? '' : 'none';
+  $('#tapRightTop').style.display = topBottom ? '' : 'none';
+  $('#tapRightBottom').style.display = topBottom ? '' : 'none';
+}
 
 // Shared touch handlers, attached both to the outer pane (for the tap-zone strips and any
 // blank chrome) and, via the epub.js content hook below, directly onto each chapter's iframe
@@ -1060,6 +1099,12 @@ bindRange('#letterRange','letterSpacing', v=>v.toFixed(1));
 bindRange('#paraRange','paraSpacing', v=>v.toFixed(1));
 bindRange('#wpmRange','wpm', v=>Math.round(v), updateBottomBar, false);
 
+$('#tapLayoutSwitch').addEventListener('click', ()=>{
+  settings.tapLayout = (settings.tapLayout === 'topBottom') ? 'sides' : 'topBottom';
+  persistSettings();
+  refreshSettingsUI();
+});
+
 $('#removeBookBtn').addEventListener('click', ()=>{
   if(!book) return;
   if(!confirm('Remove "'+book.title+'" from your library? (The file on your device is not deleted.)')) return;
@@ -1084,6 +1129,8 @@ function refreshSettingsUI(){
   $('#paraRange').value = settings.paraSpacing; $('#paraVal').textContent = settings.paraSpacing.toFixed(1);
   $('#wpmRange').value = settings.wpm; $('#wpmVal').textContent = Math.round(settings.wpm);
   updateViewModeUI();
+  $('#tapLayoutSwitch').classList.toggle('on', settings.tapLayout === 'topBottom');
+  updateTapZoneLayout();
 }
 refreshSettingsUI();
 
