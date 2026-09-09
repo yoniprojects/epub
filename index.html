@@ -98,10 +98,8 @@ body[data-theme="paper"] #app{
 #scrollPane{position:absolute;inset:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;}
 
 /* page mode */
-#pagePane{position:absolute;inset:0;overflow:hidden;touch-action:pan-y;}
-#pagePane.dragging{touch-action:none;}
-#pageViewport{position:absolute;inset:0;overflow:hidden;will-change:transform,filter;}
-#pageFold{position:absolute;inset:0;z-index:6;pointer-events:none;opacity:0;mix-blend-mode:multiply;}
+#pagePane{position:absolute;inset:0;overflow:hidden;}
+#pageViewport{position:absolute;inset:0;overflow:hidden;}
 .tap-zone{position:absolute;top:0;bottom:0;width:22%;z-index:5;}
 .tap-zone.left{left:0;}
 .tap-zone.right{right:0;}
@@ -213,7 +211,6 @@ input[type=range]{width:100%;accent-color:var(--accent);}
 
       <div id="pagePane">
         <div id="pageViewport"></div>
-        <div id="pageFold"></div>
         <div class="tap-zone left" id="tapLeft"></div>
         <div class="tap-zone right" id="tapRight"></div>
       </div>
@@ -278,13 +275,6 @@ input[type=range]{width:100%;accent-color:var(--accent);}
       </div>
     </div>
 
-    <div class="setting-group" id="animGroup">
-      <div class="toggle-row">
-        <label>Page-flip animation</label>
-        <div class="switch" id="animToggle"><i></i></div>
-      </div>
-    </div>
-
     <div class="setting-group">
       <h4>Reading speed — <span id="wpmVal"></span> wpm</h4>
       <input type="range" id="wpmRange" min="120" max="450" step="10">
@@ -327,7 +317,7 @@ function saveJSON(key, val){
 
 const DEFAULT_SETTINGS = {
   theme:'light', font:'literata', fontSize:18, lineHeight:1.7, letterSpacing:0, paraSpacing:1,
-  viewMode:'page', pageAnim:true, percentVisible:true, statusMode:1, rulerOn:false, rulerPos:0.42, wpm:230
+  viewMode:'page', percentVisible:true, statusMode:1, rulerOn:false, rulerPos:0.42, wpm:230
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS, loadJSON(LS_SETTINGS, {}));
 let library = loadJSON(LS_LIB, []); // [{id,title,author,coverDataUrl,name,size,lastModified,hasHandle}]
@@ -422,7 +412,7 @@ const libraryEl = $('#library'), readerEl = $('#reader');
 const shelfEl = $('#shelf'), libEmptyEl = $('#libEmpty');
 const fileInput = $('#fileInput');
 const scrollPane = $('#scrollPane');
-const pagePane = $('#pagePane'), pageViewport = $('#pageViewport'), pageFold = $('#pageFold');
+const pagePane = $('#pagePane'), pageViewport = $('#pageViewport');
 const rulerEl = $('#ruler');
 const settingsSheet = $('#settingsSheet'), scrim = $('#scrim');
 const tocSheet = $('#tocSheet'), tocList = $('#tocList');
@@ -819,184 +809,42 @@ function isRTL(){ return !!(book && book.dir==='rtl'); }
 // visualDir is the physical/on-screen direction the gesture implies ('left' or 'right'),
 // independent of reading direction — RTL vs LTR only changes which epub.js call it maps to,
 // so a left swipe/tap always *looks* like a left-moving turn, in either language.
-//
-// The flip is a draggable 3D hinge, closer to a real paper page: the current page rotates
-// away edge-on around its spine as you drag (like slowly opening a door), tracking your
-// finger in real time with a shadow that deepens the further it lifts. Let go past the
-// commit point (or flick fast enough) and it swings the rest of the way, the content swaps
-// at the invisible 90° point, then the new page swings in from the opposite spine — release
-// early and it springs back flat instead, exactly where you left it.
-const FLIP_PERSPECTIVE = '1400px';
-const MAX_ANGLE = 88;                 // deg — just short of 90 so the page never fully vanishes
-const COMMIT_RATIO = 0.35;            // drag past 35% of the travel distance completes the turn
-const FLICK_VELOCITY = 0.6;           // px/ms — a fast short flick completes the turn too
-const FLIP_OUT_MS = 150, FLIP_IN_MS = 260, SNAPBACK_MS = 200;
-let isFlipping = false;
-let suppressClick = false;
-let dragCandidate = null; // {pointerId,x0,y0,started,visualDir,paneWidth,progress,lastX,lastT,velocity}
-
-function canFlipDir(visualDir){
-  if(!book || !book.rendition) return false;
+function turnPage(visualDir){
+  if(!book || !book.rendition) return;
   const goNext = (visualDir==='left') ? !isRTL() : isRTL();
-  if(goNext && book.atEnd) return false;
-  if(!goNext && book.atStart) return false;
-  return true;
+  if(goNext && book.atEnd) return;
+  if(!goNext && book.atStart) return;
+  if(goNext) book.rendition.next(); else book.rendition.prev();
 }
 
-function applyFoldVisual(visualDir, progress){
-  const angle = (visualDir==='left' ? -1 : 1) * MAX_ANGLE * progress;
-  pageViewport.style.transform = `perspective(${FLIP_PERSPECTIVE}) rotateY(${angle}deg)`;
-  pageViewport.style.filter = `brightness(${1 - progress*0.5})`;
-  pageFold.style.opacity = String(Math.min(1, progress*1.15));
-  pageFold.style.background = visualDir==='left'
-    ? 'linear-gradient(to left, rgba(0,0,0,.4), transparent 55%)'
-    : 'linear-gradient(to right, rgba(0,0,0,.4), transparent 55%)';
-}
+$('#tapLeft').addEventListener('click', ()=> turnPage('right'));
+$('#tapRight').addEventListener('click', ()=> turnPage('left'));
 
-function flipOut(visualDir){
-  pageViewport.style.transformOrigin = (visualDir==='left' ? 'left' : 'right') + ' center';
-  const toDeg = visualDir==='left' ? -MAX_ANGLE : MAX_ANGLE;
-  const anim = pageViewport.animate([
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(0deg)`, filter:'brightness(1)' },
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(${toDeg}deg)`, filter:'brightness(.5)' }
-  ], { duration:FLIP_OUT_MS, easing:'cubic-bezier(.4,0,.75,1)', fill:'forwards' });
-  return anim.finished.catch(()=>{});
-}
-function flipIn(visualDir){
-  pageViewport.style.transformOrigin = (visualDir==='left' ? 'right' : 'left') + ' center';
-  const fromDeg = visualDir==='left' ? MAX_ANGLE : -MAX_ANGLE;
-  const anim = pageViewport.animate([
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(${fromDeg}deg)`, filter:'brightness(.5)' },
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(0deg)`, filter:'brightness(1)' }
-  ], { duration:FLIP_IN_MS, easing:'cubic-bezier(.2,.65,.3,1)', fill:'forwards' });
-  return anim.finished.catch(()=>{}).then(()=>{
-    pageViewport.style.transform = '';
-    pageViewport.style.filter = '';
-    pageFold.style.opacity = '0';
-  });
-}
-
-async function turnPage(visualDir){
-  if(!book || !book.rendition || isFlipping) return;
-  if(!canFlipDir(visualDir)) return;
-  const goNext = (visualDir==='left') ? !isRTL() : isRTL();
-
-  const animated = settings.viewMode==='page' && settings.pageAnim
-    && typeof pageViewport.animate === 'function';
-
-  if(!animated){
-    if(goNext) book.rendition.next(); else book.rendition.prev();
-    return;
-  }
-  isFlipping = true;
-  try{
-    await flipOut(visualDir);
-    await Promise.resolve(goNext ? book.rendition.next() : book.rendition.prev());
-    await flipIn(visualDir);
-  } finally {
-    isFlipping = false;
-  }
-}
-
-$('#tapLeft').addEventListener('click', ()=>{ if(!suppressClick) turnPage('right'); });
-$('#tapRight').addEventListener('click', ()=>{ if(!suppressClick) turnPage('left'); });
-
-// Shared pointer handlers, attached both to the outer pane (for the tap-zone strips and any
+// Shared touch handlers, attached both to the outer pane (for the tap-zone strips and any
 // blank chrome) and, via the epub.js content hook below, directly onto each chapter's iframe
-// document — otherwise a drag that starts over the actual book text never bubbles out of the
-// iframe and dragging only worked at the very edges of the screen.
-const DRAG_START_PX = 10; // movement needed before a touch/click commits to being a drag
-
-function onPointerDown(e){
-  if(settings.viewMode!=='page' || !settings.pageAnim || !book || !book.rendition || isFlipping) return;
-  if(e.pointerType==='mouse' && e.button!==0) return;
-  dragCandidate = { pointerId:e.pointerId, x0:e.clientX, y0:e.clientY, started:false,
-    lastX:e.clientX, lastT:e.timeStamp, velocity:0 };
+// document — otherwise touches that start over the actual book text never bubble out of the
+// iframe and swiping only worked at the very edges of the screen.
+let touchStartX = null, touchStartY = null;
+function onContentTouchStart(e){
+  if(!e.touches || !e.touches.length) return;
+  touchStartX = e.touches[0].clientX; touchStartY = e.touches[0].clientY;
 }
-
-function onPointerMove(e){
-  if(!dragCandidate || dragCandidate.pointerId!==e.pointerId) return;
-  const dx = e.clientX - dragCandidate.x0;
-  const dy = e.clientY - dragCandidate.y0;
-
-  if(!dragCandidate.started){
-    if(Math.abs(dx) < DRAG_START_PX || Math.abs(dx) < Math.abs(dy)) return;
-    const visualDir = dx < 0 ? 'left' : 'right';
-    if(!canFlipDir(visualDir)){ dragCandidate = null; return; }
-    dragCandidate.started = true;
-    dragCandidate.visualDir = visualDir;
-    dragCandidate.paneWidth = pagePane.getBoundingClientRect().width || 320;
-    isFlipping = true;
-    suppressClick = true;
-    pagePane.classList.add('dragging');
-    pageViewport.style.transformOrigin = (visualDir==='left' ? 'left' : 'right') + ' center';
-  }
-
-  const dt = e.timeStamp - dragCandidate.lastT;
-  if(dt > 0){ dragCandidate.velocity = Math.abs(e.clientX - dragCandidate.lastX) / dt; }
-  dragCandidate.lastX = e.clientX; dragCandidate.lastT = e.timeStamp;
-
-  const forward = dragCandidate.visualDir==='left' ? -dx : dx; // positive = further into the turn
-  const progress = Math.max(0, Math.min(1, forward / (dragCandidate.paneWidth * 0.7)));
-  dragCandidate.progress = progress;
-  applyFoldVisual(dragCandidate.visualDir, progress);
-  e.preventDefault();
+function onContentTouchEnd(e){
+  if(touchStartX===null || settings.viewMode!=='page' || !book || !book.rendition) { touchStartX=null; return; }
+  const dx = e.changedTouches[0].clientX - touchStartX;
+  const dy = e.changedTouches[0].clientY - (touchStartY||0);
+  touchStartX = null;
+  if(Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy)) return; // require a clearly horizontal swipe
+  turnPage(dx < 0 ? 'left' : 'right');
 }
-
-function completeDragFlip(visualDir, fromProgress){
-  const fromDeg = (visualDir==='left' ? -1 : 1) * MAX_ANGLE * fromProgress;
-  const toDeg = (visualDir==='left' ? -1 : 1) * MAX_ANGLE;
-  const dur = Math.max(60, FLIP_OUT_MS * (1 - fromProgress));
-  const anim = pageViewport.animate([
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(${fromDeg}deg)`, filter:`brightness(${1 - fromProgress*0.5})` },
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(${toDeg}deg)`, filter:'brightness(.5)' }
-  ], { duration:dur, easing:'cubic-bezier(.4,0,.75,1)', fill:'forwards' });
-  pageFold.style.opacity = '1';
-  anim.finished.catch(()=>{}).then(async ()=>{
-    const goNext = (visualDir==='left') ? !isRTL() : isRTL();
-    await Promise.resolve(goNext ? book.rendition.next() : book.rendition.prev());
-    await flipIn(visualDir);
-    isFlipping = false;
-  });
-}
-
-function cancelDragFlip(visualDir, fromProgress){
-  const fromDeg = (visualDir==='left' ? -1 : 1) * MAX_ANGLE * fromProgress;
-  const anim = pageViewport.animate([
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(${fromDeg}deg)`, filter:`brightness(${1 - fromProgress*0.5})` },
-    { transform:`perspective(${FLIP_PERSPECTIVE}) rotateY(0deg)`, filter:'brightness(1)' }
-  ], { duration:SNAPBACK_MS, easing:'cubic-bezier(.2,.65,.3,1)', fill:'forwards' });
-  anim.finished.catch(()=>{}).then(()=>{
-    pageViewport.style.transform = '';
-    pageViewport.style.filter = '';
-    pageFold.style.opacity = '0';
-    isFlipping = false;
-  });
-}
-
-function onPointerUp(e){
-  if(!dragCandidate || dragCandidate.pointerId!==e.pointerId) return;
-  const dc = dragCandidate; dragCandidate = null;
-  pagePane.classList.remove('dragging');
-  if(!dc.started) return; // was just a tap/click — the click handler deals with it
-  const commit = dc.progress > COMMIT_RATIO || dc.velocity > FLICK_VELOCITY;
-  if(commit) completeDragFlip(dc.visualDir, dc.progress);
-  else cancelDragFlip(dc.visualDir, dc.progress);
-  setTimeout(()=>{ suppressClick = false; }, 50);
-}
-
-pagePane.addEventListener('pointerdown', onPointerDown);
-pagePane.addEventListener('pointermove', onPointerMove, {passive:false});
-pagePane.addEventListener('pointerup', onPointerUp);
-pagePane.addEventListener('pointercancel', onPointerUp);
+pagePane.addEventListener('touchstart', onContentTouchStart, {passive:true});
+pagePane.addEventListener('touchend', onContentTouchEnd, {passive:true});
 
 function attachContentTouch(contents){
   if(!contents || !contents.document) return;
   const doc = contents.document;
-  doc.addEventListener('pointerdown', onPointerDown);
-  doc.addEventListener('pointermove', onPointerMove, {passive:false});
-  doc.addEventListener('pointerup', onPointerUp);
-  doc.addEventListener('pointercancel', onPointerUp);
+  doc.addEventListener('touchstart', onContentTouchStart, {passive:true});
+  doc.addEventListener('touchend', onContentTouchEnd, {passive:true});
 }
 
 window.addEventListener('resize', debounce(()=>{
@@ -1006,8 +854,6 @@ window.addEventListener('resize', debounce(()=>{
 /* ---------- View mode switching ---------- */
 function updateViewModeUI(){
   document.querySelectorAll('#viewSeg button').forEach(b=>b.classList.toggle('active', b.dataset.v===settings.viewMode));
-  $('#animGroup').style.opacity = settings.viewMode==='page' ? '1':'.4';
-  $('#animGroup').style.pointerEvents = settings.viewMode==='page' ? 'auto':'none';
 }
 $('#viewSeg').addEventListener('click', e=>{
   const btn = e.target.closest('button'); if(!btn) return;
@@ -1208,12 +1054,6 @@ bindRange('#letterRange','letterSpacing', v=>v.toFixed(1));
 bindRange('#paraRange','paraSpacing', v=>v.toFixed(1));
 bindRange('#wpmRange','wpm', v=>Math.round(v), updateBottomBar, false);
 
-$('#animToggle').addEventListener('click', ()=>{
-  settings.pageAnim = !settings.pageAnim;
-  persistSettings();
-  refreshSettingsUI();
-});
-
 $('#removeBookBtn').addEventListener('click', ()=>{
   if(!book) return;
   if(!confirm('Remove "'+book.title+'" from your library? (The file on your device is not deleted.)')) return;
@@ -1237,7 +1077,6 @@ function refreshSettingsUI(){
   $('#letterRange').value = settings.letterSpacing; $('#letterVal').textContent = settings.letterSpacing.toFixed(1);
   $('#paraRange').value = settings.paraSpacing; $('#paraVal').textContent = settings.paraSpacing.toFixed(1);
   $('#wpmRange').value = settings.wpm; $('#wpmVal').textContent = Math.round(settings.wpm);
-  $('#animToggle').classList.toggle('on', settings.pageAnim);
   updateViewModeUI();
 }
 refreshSettingsUI();
