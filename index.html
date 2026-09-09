@@ -817,13 +817,17 @@ function turnPage(visualDir){
   if(goNext) book.rendition.next(); else book.rendition.prev();
 }
 
-$('#tapLeft').addEventListener('click', ()=> turnPage('right'));
-$('#tapRight').addEventListener('click', ()=> turnPage('left'));
+let suppressTapClick = false;
+$('#tapLeft').addEventListener('click', ()=>{ if(!suppressTapClick) turnPage('right'); });
+$('#tapRight').addEventListener('click', ()=>{ if(!suppressTapClick) turnPage('left'); });
 
 // Shared touch handlers, attached both to the outer pane (for the tap-zone strips and any
 // blank chrome) and, via the epub.js content hook below, directly onto each chapter's iframe
 // document — otherwise touches that start over the actual book text never bubble out of the
-// iframe and swiping only worked at the very edges of the screen.
+// iframe and swiping only worked at the very edges of the screen. Direction always follows
+// the swipe itself (left-moving swipe = forward, right-moving = back) no matter where on the
+// page it started or ended — including over the tap-zone strips, where we briefly suppress
+// the strip's own click so a swipe there isn't immediately re-triggered as a fixed-direction tap.
 let touchStartX = null, touchStartY = null;
 function onContentTouchStart(e){
   if(!e.touches || !e.touches.length) return;
@@ -835,7 +839,9 @@ function onContentTouchEnd(e){
   const dy = e.changedTouches[0].clientY - (touchStartY||0);
   touchStartX = null;
   if(Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy)) return; // require a clearly horizontal swipe
+  suppressTapClick = true;
   turnPage(dx < 0 ? 'left' : 'right');
+  setTimeout(()=>{ suppressTapClick = false; }, 400);
 }
 pagePane.addEventListener('touchstart', onContentTouchStart, {passive:true});
 pagePane.addEventListener('touchend', onContentTouchEnd, {passive:true});
